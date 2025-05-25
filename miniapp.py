@@ -3,14 +3,24 @@ import json
 import hashlib
 import requests
 from fastapi import FastAPI
-from threading import Thread
+from threading import Thread, Lock
 import uvicorn
 import random
 
 app = FastAPI()
 
+# State
 LAST_DATA = {}
-COMPUTED_RESULT = {}
+COMPUTED_RESULT = None
+_changed_since_last_compute = False
+_lock = Lock()
+
+# Configuration
+FETCH_INTERVALS = {
+    "iss": 5,
+    "ip": 15,
+}
+COMPUTE_INTERVAL = 5  # seconds
 
 def compute_hash(data):
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
@@ -31,43 +41,51 @@ def detect_changes(old, new):
 def simple_compute(data1, data2):
     return random.random()
 
-def polling_loop():
-    print("Polling thread started")
-    global LAST_DATA, COMPUTED_RESULT
+def fetch_loop(key, fetch_fn, interval):
+    global _changed_since_last_compute
     while True:
         try:
-            iss_data = fetch_iss_position()
-            ip_data = fetch_ip()
-
-            changed = False
-
-            if detect_changes(LAST_DATA.get("iss"), iss_data):
-                LAST_DATA["iss"] = iss_data
-                changed = True
-
-            if detect_changes(LAST_DATA.get("ip"), ip_data):
-                LAST_DATA["ip"] = ip_data
-                changed = True
-
-            if changed:
-                COMPUTED_RESULT = simple_compute(LAST_DATA.get("iss", {}), LAST_DATA.get("ip", {}))
-                print("Data changed, updated computed result:", COMPUTED_RESULT)
-            else:
-                print("No change detected")
-
+            data = fetch_fn()
+            with _lock:
+                if detect_changes(LAST_DATA.get(key), data):
+                    LAST_DATA[key] = data
+                    _changed_since_last_compute = True
+                    print(f"[{key}] Data changed.")
+                else:
+                    print(f"[{key}] No change.")
         except Exception as e:
-            print(f"Polling error: {e}")
+            print(f"[{key}] Fetch error: {e}")
+        time.sleep(interval)
 
-        time.sleep(10)
+def compute_loop():
+    global COMPUTED_RESULT, _changed_since_last_compute
+    while True:
+        time.sleep(COMPUTE_INTERVAL)
+        with _lock:
+            if _changed_since_last_compute:
+                COMPUTED_RESULT = simple_compute(
+                    LAST_DATA.get("iss", {}),
+                    LAST_DATA.get("ip", {})
+                )
+                print("[COMPUTE] Updated result:", COMPUTED_RESULT)
+                _changed_since_last_compute = False
+            else:
+                print("[COMPUTE] No changes to compute.")
 
 @app.get("/latest")
 def get_latest():
-    return {
-        "iss": LAST_DATA.get("iss"),
-        "ip": LAST_DATA.get("ip"),
-        "computed": COMPUTED_RESULT
-    }
+    with _lock:
+        return {
+            "iss": LAST_DATA.get("iss"),
+            "ip": LAST_DATA.get("ip"),
+            "computed": COMPUTED_RESULT
+        }
+
+def start_polling_threads():
+    Thread(target=fetch_loop, args=("iss", fetch_iss_position, FETCH_INTERVALS["iss"]), daemon=True).start()
+    Thread(target=fetch_loop, args=("ip", fetch_ip, FETCH_INTERVALS["ip"]), daemon=True).start()
+    Thread(target=compute_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    Thread(target=polling_loop, daemon=True).start()
+    start_polling_threads()
     uvicorn.run(app, host="127.0.0.1", port=8000)
